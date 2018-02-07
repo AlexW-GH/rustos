@@ -1,5 +1,5 @@
 global start
-
+extern long_mode_start
 
 section .text
 bits 32
@@ -9,9 +9,13 @@ start:
     call check_multiboot
     call check_cpuid
     call check_long_mode
-    ;print OK to VGA-textbuffer, 0x2f = White Letter / Green Background, 0x4b = 'K', 0x4f = 'O'
-    mov dword [0xb8000], 0x2f4b2f4f
-    hlt
+
+    call set_up_page_tables
+    call enable_paging
+
+    lgdt [gdt64.pointer]
+
+    jmp gdt64.code:long_mode_start
 
 check_multiboot:
     ; magic number according to multiboot specification that is written to eax by the bootloader
@@ -77,6 +81,65 @@ check_long_mode:
     mov al, "3"
     jmp error
 
+set_up_page_tables:
+    ; map first PML4 entry to PDP table
+    mov eax, pdp_table
+    or eax, 0b11 ; present + writable
+    mov [pml4_table], eax
+
+    ; map first PDP entry to PD table
+    mov eax, pd_table
+    or eax, 0b11 ; present + writable
+    mov [pdp_table], eax
+
+    ; map each P2 entry to a huge 2MiB page
+    mov ecx, 0         ; counter variable
+
+.map_pd_table:
+    ; map ecx-th PD entry to a huge page that starts at address 2MiB*ecx
+    mov eax, 0x200000  ; 2MiB
+    mul ecx            ; start address of ecx-th page
+    or eax, 0b10000011 ; present + writable + huge
+    mov [pd_table + ecx * 8], eax ; map ecx-th entry
+
+    inc ecx            ; increase counter
+    cmp ecx, 512       ; if counter == 512, the whole P2 table is mapped
+    jne .map_pd_table  ; else map the next entry
+
+    ret
+
+enable_paging:
+    ; load PML4 to cr3 register (cpu uses this to access the PML4 table)
+    mov eax, pml4_table
+    mov cr3, eax
+
+    ; enable PAE-flag in cr4 (Physical Address Extension)
+    mov eax, cr4
+    or eax, 1 << 5
+    mov cr4, eax
+
+    ; set the long mode bit in the EFER MSR (model specific register)
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, 1 << 8
+    wrmsr
+
+    ; enable paging in the cr0 register
+    mov eax, cr0
+    or eax, 1 << 31
+    mov cr0, eax
+
+    ret
+
+section .rodata
+gdt64:
+    dq 0 ; zero entry
+.code: equ $ - gdt64 ; new
+    dq (1<<43) | (1<<44) | (1<<47) | (1<<53) ; code segment
+.pointer:
+    dw $ - gdt64 - 1
+    dq gdt64
+
 ; Prints `ERR: ` and the related error code to the VGA-textbuffer, halts the program
 error:
     ; 0x4f = White Letter / Red Background
@@ -93,6 +156,13 @@ error:
     hlt
 
 section .bss ; Basic Service Set
+align 4096
+pml4_table:
+    resb 4096
+pdp_table:
+    resb 4096
+pd_table:
+    resb 4096
 stack_bottom:
     resb 64 ; reserve 64 Byte
 stack_top:
